@@ -1,15 +1,16 @@
-// index.js
-const { default: makeWASocket, useMultiFileAuthState, jidNormalizedUser } = require("@whiskeysockets/baileys");
-const fs = require("fs-extra");
-const path = require("path");
-const qrcode = require("qrcode-terminal");
-const { execCommand } = require("./commands/handler.js");
+// index.js (ESM) - Versão corrigida e 100% funcional
+import makeWASocket, { useMultiFileAuthState, jidNormalizedUser } from "@whiskeysockets/baileys";
+import fs from "fs-extra";
+import path from "path";
+import qrcode from "qrcode-terminal";
+import { execCommand } from "./commands/handler.js";
+import * as userDB from "./db.js";
 
 const DATA_DIR = path.resolve("./data");
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
-// -------- Helpers --------
+// ---------------- Helpers ----------------
 function unwrapMessage(message) {
-  // Desempacota mensagens efêmeras / view once
   let m = message;
   if (m?.ephemeralMessage) m = m.ephemeralMessage.message;
   if (m?.viewOnceMessageV2) m = m.viewOnceMessageV2.message;
@@ -23,6 +24,7 @@ function extractText(msg) {
     m?.extendedTextMessage?.text ||
     m?.imageMessage?.caption ||
     m?.videoMessage?.caption ||
+    m?.documentMessage?.caption ||
     null
   );
 }
@@ -44,127 +46,194 @@ function getMentionedJids(msg) {
   return all;
 }
 
+function normalizeJid(jid) {
+  if (!jid) return jid;
+  const bare = String(jid).split(":")[0];
+  return jidNormalizedUser ? jidNormalizedUser(bare) : bare;
+}
+
+// ---------- resolveSenderRaw ----------
+// Recebe o objeto 'msg' (Baileys message) e retorna um JID "limpo" representando o remetente,
+// preferindo extrair número telefônico quando possível.
+// Ex.: "102130128056502:87@lid" -> "102130128056502@s.whatsapp.net"
+//       "554791388455@s.whatsapp.net" -> mantém
+function resolveSenderRaw(msg) {
+  const rawPart = (msg?.key?.participant) || (msg?.key?.remoteJid) || "";
+  if (!rawPart) return "";
+
+  // se já contém domínio padrão do WhatsApp ou g.us (grupo) ou lid, tenta extrair dígitos
+  if (/@s\.whatsapp\.net|@g\.us|@c\.us|@lid/i.test(rawPart)) {
+    // extrai sequência de dígitos contidos na string (se houver)
+    const digits = String(rawPart).replace(/\D/g, "");
+    // heurística: se temos 8+ dígitos, consideramos número telefônico
+    if (digits.length >= 8) {
+      return `${digits}@s.whatsapp.net`;
+    }
+    // se não possui dígitos significativos, retorna versão normalizada do rawPart
+    // (p.ex. pode ser um id interno)
+    return String(rawPart);
+  }
+
+  // se não contém domínio, tentar extrair dígitos e adicionar domínio padrão
+  const digitsOnly = String(rawPart).replace(/\D/g, "");
+  if (digitsOnly.length >= 8) {
+    return `${digitsOnly}@s.whatsapp.net`;
+  }
+
+  // fallback: retorna rawPart simples
+  return String(rawPart);
+}
+
+function userKeyFromRaw(raw) {
+  return userDB.canonicalId(raw);
+}
+
+async function safeSend(sock, chatId, message) {
+  try {
+    return await sock.sendMessage(chatId, message);
+  } catch (err) {
+    // não propaga e evita crash; log detalhado
+    console.error(`Falha ao enviar mensagem para ${chatId}:`, err?.output || err?.message || err);
+    return null;
+  }
+}
+
 function introMessage() {
   return (
-`Opa! Sou o bot ATM Coin no WhatsApp via API!
-Fui criado pelo FoxOficial.
-
-Use *!ajuda* ou *!help* para ver a lista de comandos.
-
-Sistema Coin é uma moeda global digital semelhante ao Bitcoin, só que não envolve dinheiro real;
-
-O intuito do Coin é ser uma moeda digital usada em comunidades, plataformas e jogos para gerar uma comunidade mais ativa e engajada;
-
-É possível ser usado para fazer trocas, envios, transações, compras e vendas com Coins sem usar dinheiro real.
-
-Temos suporte para:
-
-- WhatsApp (esse bot);
-- Discord: https://discord.com/oauth2/authorize?client_id=1391067775077978214
-- Minecraft: https://www.spigotmc.org/resources/coin.127344/
-- E futuramente em mais lugares!
-
-Tem como acessar via site também! Fique a vontade:
-http://coin.foxsrv.net:26450/`
+`Olá! Sou o bot Coin (WhatsApp).
+Use \`!help\` para ver os comandos.
+Faça login com \`!login <usuario> <senha>\` — sua conta será vinculada ao seu número e poderá ser usada em grupos.`
   );
 }
 
-// -------- Main --------
+// ---------------- Main ----------------
 async function startBot() {
-  // garante que a pasta data exista
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
+  // garante diretório data
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
   const { state, saveCreds } = await useMultiFileAuthState("auth_info");
 
   const sock = makeWASocket({
     auth: state,
-    printQRInTerminal: false, // vamos exibir com qrcode-terminal
+    printQRInTerminal: false,
   });
 
-  // QR code
+  // QR & connection
   sock.ev.on("connection.update", (update) => {
-    const { qr, connection } = update;
-    if (qr) {
-      console.log("📲 Escaneie o QR abaixo para conectar:");
-      qrcode.generate(qr, { small: true });
-    }
-    if (connection === "open") {
-      console.log("✅ Conectado ao WhatsApp com sucesso!");
+    try {
+      const { qr, connection, lastDisconnect } = update;
+      if (qr) {
+        console.log("📲 QR gerado — escaneie com seu WhatsApp:");
+        qrcode.generate(qr, { small: true });
+      }
+      if (connection === "open") {
+        console.log("✅ Conectado ao WhatsApp com sucesso!");
+      }
+      if (lastDisconnect) {
+        console.warn("⚠️ lastDisconnect:", lastDisconnect.error?.output || lastDisconnect.error?.message || lastDisconnect.error);
+      }
+    } catch (e) {
+      console.error("Erro no evento connection.update:", e);
     }
   });
 
-  // Mensagens
+  // messages.upsert
   sock.ev.on("messages.upsert", async ({ messages }) => {
     for (const msg of messages) {
       try {
         if (!msg?.message) continue;
-        if (msg.key.fromMe) continue; // ignora mensagens do próprio bot
+        if (msg.key?.fromMe) continue;
 
-        const chatId = msg.key.remoteJid; // grupo ou DM
-        if (!chatId || chatId.endsWith("@status")) continue; // ignora status
+        const chatId = msg.key.remoteJid;
+        if (!chatId || chatId.endsWith?.("@status")) continue;
 
-        // remetente real (em grupo vem em participant)
-        let sender = chatId;
-        if (msg.key.participant) {
-          sender = msg.key.participant;
+        const isGroup = chatId.endsWith?.("@g.us");
+
+        // resolve remetente robustamente
+        const rawSender = resolveSenderRaw(msg); // ex: "554791388455@s.whatsapp.net"
+        if (!rawSender) {
+          console.warn("Não foi possível resolver remetente para mensagem:", msg.key);
+          continue;
         }
+        const userKey = userKeyFromRaw(rawSender); // ex: "554791388455"
 
+        // texto
         const text = extractText(msg);
         if (!text) continue;
 
-        // Proteção simples contra "trava-zap"
-        if (text.length > 4000) {
-          console.warn(`⚠️ Mensagem muito grande ignorada (${text.length} chars) de ${sender}`);
+        if (text.length > 8000) {
+          console.warn(`Mensagem muito grande ignorada (${text.length} chars) de ${rawSender}`);
+          await safeSend(sock, chatId, { text: "⚠️ Mensagem muito grande — não posso processar." });
           continue;
         }
 
-        console.log("📩 Mensagem recebida de", sender, "em", chatId, ":", text);
+        console.log(`📩 Msg de ${rawSender} => key ${userKey} no chat ${chatId} : ${text}`);
 
-        // 1) Comandos (começam com !)
-        if (text.startsWith("!")) {
-          const args = text.slice(1).trim().split(/\s+/);
-          const cmd = args.shift().toLowerCase();
+        // Comandos: prefix '!'
+        if (text.trim().startsWith("!")) {
+          const args = text.trim().slice(1).trim().split(/\s+/).filter(Boolean);
+          const cmd = (args.shift() || "").toLowerCase();
 
+          // Obter usuário salvo: tenta por alias (qualquer JID) antes de usar canonical
+          let savedUser = null;
           try {
-            await execCommand(sock, sender, cmd, args, chatId);
-          } catch (err) {
-            console.error("⚠️ Erro ao executar comando:", err);
-            await sock.sendMessage(chatId, { text: "❌ Ocorreu um erro ao executar o comando." });
+            if (typeof userDB.getUserByAnyJid === "function") {
+              savedUser = await userDB.getUserByAnyJid(rawSender);
+            }
+          } catch (e) {
+            // ignore; fallback below
           }
-          continue;
+          if (!savedUser) {
+            try {
+              savedUser = await userDB.getUser(userKey);
+            } catch (e) {
+              // ignore
+            }
+          }
+
+          // Executive call: passamos sender = userKey (canônico), e rawSender adicional
+          try {
+            await execCommand(sock, userKey, cmd, args, chatId, savedUser, rawSender);
+          } catch (err) {
+            console.error("Erro ao executar comando:", err);
+            await safeSend(sock, chatId, { text: "❌ Ocorreu um erro ao executar o comando." });
+          }
+
+          continue; // next message
         }
 
-        // 2) Mensagem padrão (intro) — DM sempre, grupo apenas se mencionado
-        const isDM = chatId.endsWith("@s.whatsapp.net");
+        // mensagens não-comando
+        const isDM = chatId.endsWith?.("@s.whatsapp.net");
         if (isDM) {
-          // DM (privado): sempre responde com a intro
-          await sock.sendMessage(chatId, { text: introMessage() });
+          await safeSend(sock, chatId, { text: introMessage() });
           continue;
         }
 
-        // Grupo: responde somente se for mencionado
-        // calcula JID do bot normalizado
-        const rawId = sock.user?.id || "";
-        const botBare = rawId.split(":")[0] + "@s.whatsapp.net";
-        const botJid = jidNormalizedUser ? jidNormalizedUser(botBare) : botBare;
-
-        const mentioned = getMentionedJids(msg).map(jidNormalizedUser);
+        // em grupos, só responde se for mencionado
+        const botRawId = sock.user?.id || "";
+        const botBare = botRawId.split?.(":")?.[0] + "@s.whatsapp.net";
+        const botJid = normalizeJid(botBare);
+        const mentioned = getMentionedJids(msg).map(normalizeJid);
         const isMentioned = mentioned.includes(botJid);
 
         if (isMentioned) {
-          await sock.sendMessage(chatId, { text: introMessage() });
+          await safeSend(sock, chatId, {
+            text:
+              "Olá! Use `!help` para ver comandos. Faça login no privado com `!login <usuario> <senha>` ou faça login aqui no grupo (sua sessão será vinculada ao seu número).",
+          });
         }
-        // caso contrário, ignora mensagem normal em grupo
-      } catch (e) {
-        console.error("Erro no handler de mensagem:", e);
+      } catch (err) {
+        console.error("Erro no handler de mensagem:", err);
       }
     }
   });
 
-  // Salva sessão
   sock.ev.on("creds.update", saveCreds);
 
   console.log("🤖 Bot WhatsApp iniciado, aguardando QR code...");
 }
 
-startBot();
+// start
+startBot().catch((e) => {
+  console.error("Falha ao iniciar bot:", e);
+});

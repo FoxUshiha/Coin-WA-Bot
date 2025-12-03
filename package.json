@@ -1,17 +1,20 @@
 {
   "name": "whatsapp_coin-bot",
   "version": "1.0.0",
+  "description": "",
   "main": "index.js",
+  "type": "module",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node index.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "type": "commonjs",
-  "description": "",
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
-    "@whiskeysockets/baileys": "^7.0.0-rc.3",
+    "@whiskeysockets/baileys": "^7.0.0-rc.9",
     "axios": "^1.12.2",
     "fs-extra": "^11.3.2",
     "qrcode-terminal": "^0.12.0",
