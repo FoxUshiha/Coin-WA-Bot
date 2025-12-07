@@ -1,0 +1,11 @@
+# config.yml
+coin_api_url: "http://coin.foxsrv.net:26450"
+download_price: 0.00000064
+download_receiver_card: "1f6c293c3951"
+ytdlp_path: "./yt-dlp.exe"       # ou absolute path
+ffmpeg_path: "./ffmpeg.exe"
+upload_limit_mb: 15
+queue_max_items: 60
+queue_max_bytes: 524288000   # 500MB
+concurrent_downloads: 2
+tmp_dir: "./tmp"
